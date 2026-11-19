@@ -1,27 +1,34 @@
-// FFI offline game - LGL Mod Menu (Android-Mod-Menu) এর jni/Main.cpp
-// dump.cs থেকে পাওয়া আসল ক্লাস/মেথডের নাম বসানো আছে। অফসেট নয়, নাম দিয়ে ফাংশন খোঁজা হয়।
-// অনুমান/ঝুঁকির জায়গাগুলোয় "CHECK:" লেখা আছে।
+// FFI offline game - LGL Mod Menu v5.0 এর জন্য Main.cpp
+// ক্লাস/মেথডের নাম dump.cs থেকে নেওয়া। ফাংশন নাম দিয়ে খোঁজা হয় (অফসেট লাগে না)।
+// "CHECK:" লেখা জায়গাগুলো ফোনে টেস্ট করে দেখতে হবে।
 //
-// গেমের "গ্লোবাল" = Gloo Wall (PlayerController.WallCount, AddGlooWalls)
-// লবির Coin/Diamond = MenuController.CoinTransation / DimondTransation (শুধু লবিতে কাজ করবে)
-// ম্যাচের ভেতরের টাকা = GameManager.AddMoney (CS মোডের টাকা)
+// গেমের "গ্লোবাল" = Gloo Wall (PlayerController.WallCount / AddGlooWalls)
+// লবির Coin/Diamond = MenuController.CoinTransation / DimondTransation (লবিতে কাজ করবে)
+// ম্যাচের টাকা = GameManager.AddMoney
 
-#include <jni.h>
-#include <dlfcn.h>
-#include <pthread.h>
-#include <unistd.h>
-#include <string>
+#include <list>
 #include <vector>
+#include <cstring>
+#include <pthread.h>
+#include <thread>
+#include <string>
+#include <jni.h>
+#include <unistd.h>
+#include <fstream>
+#include <iostream>
+#include <dlfcn.h>
 #include <cstdlib>
 #include "Includes/Logger.h"
 #include "Includes/obfuscate.h"
-#include "Includes/Utils.h"
-#include "Menu.h"
+#include "Includes/Utils.hpp"
+#include "Menu/Menu.hpp"
+#include "Menu/Jni.hpp"
+#include "Includes/Macros.h"
 #include "dobby.h"
 
-#define TAG "FFIMOD"
+#define targetLibName OBFUSCATE("libil2cpp.so")
 
-// ---------- IL2CPP API ----------
+// ---------- IL2CPP API (libil2cpp.so এক্সপোর্ট করে) ----------
 typedef void*  (*t_void)();
 typedef void** (*t_asms)(void*, size_t*);
 typedef void*  (*t_p1)(void*);
@@ -29,83 +36,85 @@ typedef void*  (*t_cls)(void*, const char*, const char*);
 typedef void*  (*t_meth)(void*, const char*, int);
 typedef void*  (*t_field)(void*, const char*);
 typedef void   (*t_sget)(void*, void*);
-static t_void il2cpp_domain_get;      static t_asms il2cpp_domain_get_assemblies;
-static t_p1   il2cpp_assembly_get_image, il2cpp_thread_attach, il2cpp_class_get_type, il2cpp_type_get_object;
-static t_cls  il2cpp_class_from_name; static t_meth il2cpp_class_get_method_from_name;
-static t_field il2cpp_class_get_field_from_name; static t_sget il2cpp_field_static_get_value;
+static t_void  il2_domain_get;
+static t_asms  il2_domain_get_assemblies;
+static t_p1    il2_assembly_get_image, il2_thread_attach, il2_class_get_type, il2_type_get_object;
+static t_cls   il2_class_from_name;
+static t_meth  il2_class_get_method_from_name;
+static t_field il2_class_get_field_from_name;
+static t_sget  il2_field_static_get_value;
 
-static void* FindClass(const char* cls) {
-    size_t n = 0; void** a = il2cpp_domain_get_assemblies(il2cpp_domain_get(), &n);
+static void* m_FindClass(const char* cls) {
+    size_t n = 0; void** a = il2_domain_get_assemblies(il2_domain_get(), &n);
     for (size_t i = 0; i < n; i++) {
-        void* k = il2cpp_class_from_name(il2cpp_assembly_get_image(a[i]), "", cls);
+        void* k = il2_class_from_name(il2_assembly_get_image(a[i]), "", cls);
         if (k) return k;
     }
     return nullptr;
 }
-static void* FindMethodNS(const char* ns, const char* cls, const char* m, int argc) {
-    size_t n = 0; void** a = il2cpp_domain_get_assemblies(il2cpp_domain_get(), &n);
+static void* m_FindMethodNS(const char* ns, const char* cls, const char* m, int argc) {
+    size_t n = 0; void** a = il2_domain_get_assemblies(il2_domain_get(), &n);
     for (size_t i = 0; i < n; i++) {
-        void* k = il2cpp_class_from_name(il2cpp_assembly_get_image(a[i]), ns, cls);
+        void* k = il2_class_from_name(il2_assembly_get_image(a[i]), ns, cls);
         if (!k) continue;
-        void** mi = (void**) il2cpp_class_get_method_from_name(k, m, argc);
+        void** mi = (void**) il2_class_get_method_from_name(k, m, argc);
         if (mi) return *mi;
     }
     LOGE("method not found: %s::%s", cls, m);
     return nullptr;
 }
-static void* FindMethod(const char* cls, const char* m, int argc) { return FindMethodNS("", cls, m, argc); }
+static void* m_FindMethod(const char* cls, const char* m, int argc) { return m_FindMethodNS("", cls, m, argc); }
 
-// static ফিল্ড পড়া (যেমন MenuController.instance)
-static void* GetStatic(const char* cls, const char* field) {
-    void* k = FindClass(cls); if (!k) return nullptr;
-    void* f = il2cpp_class_get_field_from_name(k, field); if (!f) return nullptr;
-    void* out = nullptr; il2cpp_field_static_get_value(f, &out); return out;
+static void* m_GetStatic(const char* cls, const char* field) {
+    void* k = m_FindClass(cls); if (!k) return nullptr;
+    void* f = il2_class_get_field_from_name(k, field); if (!f) return nullptr;
+    void* out = nullptr; il2_field_static_get_value(f, &out); return out;
 }
 
 // ---------- অবস্থা ----------
-static bool oneHitKill, unlimitedHealth, unlimitedGloo;
+static bool oneHitKill = false, unlimitedHealth = false, unlimitedGloo = false;
 static int  gunSlot = 0, gunNumber = 0;
 
 struct V3 { float x, y, z; };
 struct Q4 { float x, y, z, w; };
 
-static void* LocalPlayerHealth() { return GetStatic("GameManager", "NewPlayer"); } // CHECK: NewPlayer = নিজের খেলোয়াড় কিনা
+static void* LocalPlayerHealth() { return m_GetStatic("GameManager", "NewPlayer"); } // CHECK: NewPlayer = নিজের খেলোয়াড়?
 
 // ---------- হুক ----------
-// Unlimited Health (শুধু নিজের PlayerHealth এ)
-void (*old_GetDamage)(void*, int, uint8_t, void*);
-void new_GetDamage(void* self, int d, uint8_t actor, void* mi) {
+// Unlimited Health
+static void (*old_GetDamage)(void*, int, uint8_t, void*);
+static void new_GetDamage(void* self, int d, uint8_t actor, void* mi) {
     if (unlimitedHealth && self == LocalPlayerHealth()) return;
     old_GetDamage(self, d, actor, mi);
 }
-void (*old_ApplyDamagePlayer)(void*, int, uint8_t, V3, Q4, void*);
-void new_ApplyDamagePlayer(void* self, int d, uint8_t actor, V3 p, Q4 r, void* mi) {
+static void (*old_ApplyDamagePlayer)(void*, int, uint8_t, V3, Q4, void*);
+static void new_ApplyDamagePlayer(void* self, int d, uint8_t actor, V3 p, Q4 r, void* mi) {
     if (unlimitedHealth && self == LocalPlayerHealth()) return;
     old_ApplyDamagePlayer(self, d, actor, p, r, mi);
 }
 
-// One Hit Kill: শুধু যখন আঘাতকারী প্লেয়ার (isPlayer=true), বটের ক্ষতি বিশাল করা
-void (*old_AI_TakeDamage)(void*, int16_t, uint8_t, bool, void*);
-void new_AI_TakeDamage(void* self, int16_t a, uint8_t actor, bool isPlayer, void* mi) {
+// One Hit Kill (শুধু প্লেয়ারের আঘাতে)
+static void (*old_AI_TakeDamage)(void*, int16_t, uint8_t, bool, void*);
+static void new_AI_TakeDamage(void* self, int16_t a, uint8_t actor, bool isPlayer, void* mi) {
     old_AI_TakeDamage(self, (oneHitKill && isPlayer) ? (int16_t) 30000 : a, actor, isPlayer, mi);
 }
-void (*old_AI_TakeDamagePV)(void*, int16_t, uint8_t, bool, void*);
-void new_AI_TakeDamagePV(void* self, int16_t a, uint8_t actor, bool isPlayer, void* mi) {
+static void (*old_AI_TakeDamagePV)(void*, int16_t, uint8_t, bool, void*);
+static void new_AI_TakeDamagePV(void* self, int16_t a, uint8_t actor, bool isPlayer, void* mi) {
     old_AI_TakeDamagePV(self, (oneHitKill && isPlayer) ? (int16_t) 30000 : a, actor, isPlayer, mi);
 }
-void (*old_AI_ApplyDamage)(void*, int, uint8_t, bool, void*);
-void new_AI_ApplyDamage(void* self, int a, uint8_t actor, bool isPlayer, void* mi) {
+static void (*old_AI_ApplyDamage)(void*, int, uint8_t, bool, void*);
+static void new_AI_ApplyDamage(void* self, int a, uint8_t actor, bool isPlayer, void* mi) {
     old_AI_ApplyDamage(self, (oneHitKill && isPlayer) ? 30000 : a, actor, isPlayer, mi);
 }
 
-// Unlimited Gloo: PlayerController.Update এ প্রতি ফ্রেমে চেক
+// Unlimited Gloo Wall
 static void (*AddGlooWalls)(void*, int, void*);
-void (*old_PC_Update)(void*, void*);
-void new_PC_Update(void* self, void* mi) {
+static void (*old_PC_Update)(void*, void*);
+static void new_PC_Update(void* self, void* mi) {
     old_PC_Update(self, mi);
     if (unlimitedGloo && AddGlooWalls) {
-        int cur = *(int*)((char*)self + 0x2CC);           // WallCount
-        if (cur < 20) AddGlooWalls(self, 20 - cur, nullptr); // 0 থাকলেও সাথে সাথে বাটন দেখাবে
+        int cur = *(int*)((char*)self + 0x2CC);               // PlayerController.WallCount
+        if (cur < 20) AddGlooWalls(self, 20 - cur, nullptr);
     }
 }
 
@@ -114,20 +123,19 @@ static void (*CoinTransation)(void*, int, int, void*);
 static void (*DimondTransation)(void*, int, int, void*);
 static void (*GM_AddMoney)(void*, int, void*);
 static void (*AddMedkitsCS)(void*, int, void*);
-static void (*SetGun)(void*, int, void*, void*);          // Inventory.SetGun(int type, WeaponData)
-static void* (*FindObjectsOfTypeAll)(void*, void*);       // UnityEngine.Resources
+static void (*InvSetGun)(void*, int, void*, void*);          // Inventory.SetGun(int type, WeaponData)
+static void* (*FindObjectsOfTypeAll)(void*, void*);          // UnityEngine.Resources
 
-// WeaponData তালিকা
 static std::vector<void*> weapons;
-static std::string Str(void* s) {                         // Il2CppString -> std::string
+static std::string m_Str(void* s) {
     if (!s) return "";
     int len = *(int*)((char*)s + 0x10); uint16_t* c = (uint16_t*)((char*)s + 0x14);
     std::string r; for (int i = 0; i < len; i++) r += (char) c[i]; return r;
 }
 static void RefreshWeapons() {
     weapons.clear();
-    void* k = FindClass("WeaponData"); if (!k || !FindObjectsOfTypeAll) return;
-    void* t = il2cpp_type_get_object(il2cpp_class_get_type(k));
+    void* k = m_FindClass("WeaponData"); if (!k || !FindObjectsOfTypeAll) return;
+    void* t = il2_type_get_object(il2_class_get_type(k));
     void* arr = FindObjectsOfTypeAll(t, nullptr);
     if (!arr) return;
     size_t n = *(size_t*)((char*)arr + 0x18); void** el = (void**)((char*)arr + 0x20);
@@ -136,122 +144,118 @@ static void RefreshWeapons() {
 static void PrintWeapons() {
     RefreshWeapons();
     for (size_t i = 0; i < weapons.size(); i++)
-        LOGI("[%s] gun #%zu = %s", TAG, i, Str(*(void**)((char*)weapons[i] + 0x28)).c_str()); // WeaponName @0x28
+        LOGI("FFIMOD gun #%zu = %s", i, m_Str(*(void**)((char*)weapons[i] + 0x28)).c_str()); // WeaponName @0x28
 }
 
-static void Hooks() {
-    void* h; while (!(h = dlopen("libil2cpp.so", RTLD_NOLOAD))) sleep(1);
-    #define SYM(n) n = (decltype(n)) dlsym(h, #n)
-    SYM(il2cpp_domain_get); SYM(il2cpp_domain_get_assemblies); SYM(il2cpp_assembly_get_image);
-    SYM(il2cpp_thread_attach); SYM(il2cpp_class_from_name); SYM(il2cpp_class_get_method_from_name);
-    SYM(il2cpp_class_get_field_from_name); SYM(il2cpp_field_static_get_value);
-    SYM(il2cpp_class_get_type); SYM(il2cpp_type_get_object);
-    sleep(10);
-    il2cpp_thread_attach(il2cpp_domain_get());
-
-    void* a;
-    #define HOOKM(cls, m, argc, nw, old) if ((a = FindMethod(cls, m, argc))) DobbyHook(a, (void*)nw, (void**)&old)
-    HOOKM("PlayerHealth", "GetDamage", 2, new_GetDamage, old_GetDamage);
-    HOOKM("PlayerHealth", "ApplyDamagePlayer", 4, new_ApplyDamagePlayer, old_ApplyDamagePlayer);
-    HOOKM("AIHealth", "TakeDamage", 3, new_AI_TakeDamage, old_AI_TakeDamage);
-    HOOKM("AIHealth", "TakeDamagePV", 3, new_AI_TakeDamagePV, old_AI_TakeDamagePV);
-    HOOKM("AIHealth", "ApplyDamage", 3, new_AI_ApplyDamage, old_AI_ApplyDamage);
-    HOOKM("PlayerController", "Update", 0, new_PC_Update, old_PC_Update);
-
-    AddGlooWalls     = (decltype(AddGlooWalls))     FindMethod("PlayerController", "AddGlooWalls", 1);
-    CoinTransation   = (decltype(CoinTransation))   FindMethod("MenuController", "CoinTransation", 2);
-    DimondTransation = (decltype(DimondTransation)) FindMethod("MenuController", "DimondTransation", 2);
-    GM_AddMoney      = (decltype(GM_AddMoney))      FindMethod("GameManager", "AddMoney", 1);
-    AddMedkitsCS     = (decltype(AddMedkitsCS))     FindMethod("PlayerHealth", "AddMedkitsCS", 1);
-    SetGun           = (decltype(SetGun))           FindMethod("Inventory", "SetGun", 2);
-    FindObjectsOfTypeAll = (decltype(FindObjectsOfTypeAll)) FindMethodNS("UnityEngine", "Resources", "FindObjectsOfTypeAll", 1);
-    LOGI("[%s] hooks ready", TAG);
-}
-void* hack_thread(void*) { Hooks(); return nullptr; }
-
-// ---------- মেনু ----------
+// ---------- মেনু তালিকা ----------
 jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
+    jobjectArray ret;
+
     const char *features[] = {
-        OBFUSCATE("Category_PLAYER"),
-        OBFUSCATE("1_Toggle_One Hit Kill"),
-        OBFUSCATE("2_Toggle_Unlimited Health"),
+            OBFUSCATE("Category_PLAYER"),
+            OBFUSCATE("1_Toggle_One Hit Kill"),
+            OBFUSCATE("2_Toggle_Unlimited Health"),
 
-        OBFUSCATE("Category_ITEMS"),
-        OBFUSCATE("3_Toggle_Unlimited Global (Gloo Wall)"),
-        OBFUSCATE("4_InputValue_Add Global"),
-        OBFUSCATE("5_InputValue_Add Medkit"),
+            OBFUSCATE("Category_ITEMS"),
+            OBFUSCATE("3_Toggle_Unlimited Global (Gloo Wall)"),
+            OBFUSCATE("4_InputValue_Add Global"),
+            OBFUSCATE("5_InputValue_Add Medkit"),
 
-        OBFUSCATE("Category_WEAPONS"),
-        OBFUSCATE("6_Spinner_Gun Slot_Slot 1,Slot 2,Slot 3"),
-        OBFUSCATE("7_InputValue_Gun Number"),
-        OBFUSCATE("8_Button_Add Gun"),
-        OBFUSCATE("9_Button_Print Gun List (logcat)"),
+            OBFUSCATE("Category_WEAPONS"),
+            OBFUSCATE("6_Spinner_Gun Slot_Slot 1,Slot 2,Slot 3"),
+            OBFUSCATE("7_InputValue_Gun Number"),
+            OBFUSCATE("8_Button_Add Gun"),
+            OBFUSCATE("9_Button_Print Gun List (logcat)"),
 
-        OBFUSCATE("Category_CURRENCY"),
-        OBFUSCATE("10_InputValue_Add/Remove Money (Lobby)"),
-        OBFUSCATE("11_InputValue_Add/Remove Diamond (Lobby)"),
-        OBFUSCATE("12_InputValue_Add Money (In Match)"),
+            OBFUSCATE("Category_CURRENCY"),
+            OBFUSCATE("10_InputValue_Add/Remove Money (Lobby)"),
+            OBFUSCATE("11_InputValue_Add/Remove Diamond (Lobby)"),
+            OBFUSCATE("12_InputValue_Add Money (In Match)"),
     };
-    int n = sizeof(features) / sizeof(features[0]);
-    jobjectArray ret = env->NewObjectArray(n, env->FindClass(OBFUSCATE("java/lang/String")), env->NewStringUTF(""));
-    for (int i = 0; i < n; i++) env->SetObjectArrayElement(ret, i, env->NewStringUTF(features[i]));
-    return ret;
+
+    int Total_Feature = (sizeof features / sizeof features[0]);
+    ret = (jobjectArray)
+            env->NewObjectArray(Total_Feature, env->FindClass(OBFUSCATE("java/lang/String")),
+                                env->NewStringUTF(""));
+    for (int i = 0; i < Total_Feature; i++)
+        env->SetObjectArrayElement(ret, i, env->NewStringUTF(features[i]));
+    return (ret);
 }
 
-void Changes(JNIEnv *env, jclass clazz, jobject obj, jint featNum, jstring featName, jint value,
-             jboolean boolean, jstring str) {
+// ---------- মেনুর বাটন/টগল ----------
+void Changes(JNIEnv *env, jclass clazz, jobject obj, jint featNum, jstring featName, jint value, jlong Lvalue, jboolean boolean, jstring text) {
     switch (featNum) {
         case 1: oneHitKill = boolean; break;
         case 2: unlimitedHealth = boolean; break;
         case 3: unlimitedGloo = boolean; break;
-        case 4: { void* p = LocalPlayerHealth(); if (p && AddGlooWalls) {
-                    void* ctrl = *(void**)((char*)p + 0x30);     // PlayerHealth.Controller
-                    if (ctrl) AddGlooWalls(ctrl, value, nullptr); } break; }
+        case 4: { void* p = LocalPlayerHealth();
+                  if (p && AddGlooWalls) {
+                      void* ctrl = *(void**)((char*)p + 0x30);     // PlayerHealth.Controller
+                      if (ctrl) AddGlooWalls(ctrl, value, nullptr);
+                  } break; }
         case 5: { void* p = LocalPlayerHealth(); if (p && AddMedkitsCS) AddMedkitsCS(p, value, nullptr); break; }
-        case 6: gunSlot = value; break;
+        case 6: gunSlot = value; break;                          // CHECK: Spinner 0 থেকে শুরু কিনা
         case 7: gunNumber = value; break;
-        case 8: { void* inv = GetStatic("Inventory", "Singleton");
+        case 8: { void* inv = m_GetStatic("Inventory", "Singleton");
                   RefreshWeapons();
-                  if (inv && SetGun && gunNumber >= 0 && gunNumber < (int) weapons.size())
-                      SetGun(inv, gunSlot, weapons[gunNumber], nullptr);
+                  if (inv && InvSetGun && gunNumber >= 0 && gunNumber < (int) weapons.size())
+                      InvSetGun(inv, gunSlot, weapons[gunNumber], nullptr);
                   break; }
         case 9: PrintWeapons(); break;
-        case 10: { void* m = GetStatic("MenuController", "instance");
+        case 10: { void* m = m_GetStatic("MenuController", "instance");
                    if (m && CoinTransation) CoinTransation(m, value >= 0 ? 0 : 1, abs(value), nullptr); break; }
-        case 11: { void* m = GetStatic("MenuController", "instance");
+        case 11: { void* m = m_GetStatic("MenuController", "instance");
                    if (m && DimondTransation) DimondTransation(m, value >= 0 ? 0 : 1, abs(value), nullptr); break; }
-        case 12: { void* g = GetStatic("GameManager", "instance");   // CHECK: static ফিল্ডের নাম (instance/Instance) যাচাই করুন
+        case 12: { void* g = m_GetStatic("GameManager", "instance");   // CHECK: static ফিল্ডের নাম
                    if (g && GM_AddMoney) GM_AddMoney(g, value, nullptr); break; }
+        default: break;
     }
 }
 
-// ---------- JNI (LGL টেমপ্লেটের মতোই) ----------
-__attribute__((constructor)) void lib_main() { pthread_t t; pthread_create(&t, nullptr, hack_thread, nullptr); }
+// ---------- হুক বসানো ----------
+static void HookIt(void* addr, void* nw, void** old) {
+    if (addr) DobbyHook(addr, (dobby_dummy_func_t) nw, (dobby_dummy_func_t *) old);
+}
 
-int RegisterMenu(JNIEnv *env) {
-    JNINativeMethod methods[] = {
-        {OBFUSCATE("Icon"), OBFUSCATE("()Ljava/lang/String;"), reinterpret_cast<void *>(Icon)},
-        {OBFUSCATE("IconWebViewData"), OBFUSCATE("()Ljava/lang/String;"), reinterpret_cast<void *>(IconWebViewData)},
-        {OBFUSCATE("IsGameLibLoaded"), OBFUSCATE("()Z"), reinterpret_cast<void *>(isGameLibLoaded)},
-        {OBFUSCATE("Init"), OBFUSCATE("(Landroid/content/Context;Landroid/widget/TextView;Landroid/widget/TextView;)V"), reinterpret_cast<void *>(Init)},
-        {OBFUSCATE("SettingsList"), OBFUSCATE("()[Ljava/lang/String;"), reinterpret_cast<void *>(SettingsList)},
-        {OBFUSCATE("GetFeatureList"), OBFUSCATE("()[Ljava/lang/String;"), reinterpret_cast<void *>(GetFeatureList)},
-    };
-    jclass c = env->FindClass(OBFUSCATE("com/android/support/Menu"));
-    if (!c) return JNI_ERR;
-    return env->RegisterNatives(c, methods, sizeof(methods) / sizeof(methods[0])) != 0 ? JNI_ERR : JNI_OK;
+void hack_thread() {
+    while (!isLibraryLoaded(targetLibName)) sleep(1);   // libil2cpp লোড হওয়া পর্যন্ত অপেক্ষা
+#if defined(__aarch64__)
+    void* h = dlopen("libil2cpp.so", RTLD_NOLOAD);
+    if (!h) { LOGE("libil2cpp handle null"); return; }
+    il2_domain_get = (t_void) dlsym(h, "il2cpp_domain_get");
+    il2_domain_get_assemblies = (t_asms) dlsym(h, "il2cpp_domain_get_assemblies");
+    il2_assembly_get_image = (t_p1) dlsym(h, "il2cpp_assembly_get_image");
+    il2_thread_attach = (t_p1) dlsym(h, "il2cpp_thread_attach");
+    il2_class_from_name = (t_cls) dlsym(h, "il2cpp_class_from_name");
+    il2_class_get_method_from_name = (t_meth) dlsym(h, "il2cpp_class_get_method_from_name");
+    il2_class_get_field_from_name = (t_field) dlsym(h, "il2cpp_class_get_field_from_name");
+    il2_field_static_get_value = (t_sget) dlsym(h, "il2cpp_field_static_get_value");
+    il2_class_get_type = (t_p1) dlsym(h, "il2cpp_class_get_type");
+    il2_type_get_object = (t_p1) dlsym(h, "il2cpp_type_get_object");
+    if (!il2_domain_get || !il2_class_from_name) { LOGE("il2cpp api missing"); return; }
+
+    sleep(10);                                           // গেম পুরো লোড হতে দিন
+    il2_thread_attach(il2_domain_get());
+
+    HookIt(m_FindMethod("PlayerHealth", "GetDamage", 2), (void*) new_GetDamage, (void**) &old_GetDamage);
+    HookIt(m_FindMethod("PlayerHealth", "ApplyDamagePlayer", 4), (void*) new_ApplyDamagePlayer, (void**) &old_ApplyDamagePlayer);
+    HookIt(m_FindMethod("AIHealth", "TakeDamage", 3), (void*) new_AI_TakeDamage, (void**) &old_AI_TakeDamage);
+    HookIt(m_FindMethod("AIHealth", "TakeDamagePV", 3), (void*) new_AI_TakeDamagePV, (void**) &old_AI_TakeDamagePV);
+    HookIt(m_FindMethod("AIHealth", "ApplyDamage", 3), (void*) new_AI_ApplyDamage, (void**) &old_AI_ApplyDamage);
+    HookIt(m_FindMethod("PlayerController", "Update", 0), (void*) new_PC_Update, (void**) &old_PC_Update);
+
+    AddGlooWalls     = (decltype(AddGlooWalls))     m_FindMethod("PlayerController", "AddGlooWalls", 1);
+    CoinTransation   = (decltype(CoinTransation))   m_FindMethod("MenuController", "CoinTransation", 2);
+    DimondTransation = (decltype(DimondTransation)) m_FindMethod("MenuController", "DimondTransation", 2);
+    GM_AddMoney      = (decltype(GM_AddMoney))      m_FindMethod("GameManager", "AddMoney", 1);
+    AddMedkitsCS     = (decltype(AddMedkitsCS))     m_FindMethod("PlayerHealth", "AddMedkitsCS", 1);
+    InvSetGun        = (decltype(InvSetGun))        m_FindMethod("Inventory", "SetGun", 2);
+    FindObjectsOfTypeAll = (decltype(FindObjectsOfTypeAll)) m_FindMethodNS("UnityEngine", "Resources", "FindObjectsOfTypeAll", 1);
+#endif
+    LOGI(OBFUSCATE("FFIMOD hooks ready"));
 }
-int RegisterPreferences(JNIEnv *env) {
-    JNINativeMethod methods[] = {
-        {OBFUSCATE("Changes"), OBFUSCATE("(Landroid/content/Context;ILjava/lang/String;IZLjava/lang/String;)V"), reinterpret_cast<void *>(Changes)},
-    };
-    jclass c = env->FindClass(OBFUSCATE("com/android/support/Preferences"));
-    if (!c) return JNI_ERR;
-    return env->RegisterNatives(c, methods, sizeof(methods) / sizeof(methods[0])) != 0 ? JNI_ERR : JNI_OK;
-}
-extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
-    JNIEnv *env; vm->GetEnv((void **) &env, JNI_VERSION_1_6);
-    if (RegisterMenu(env) != JNI_OK) return JNI_ERR;
-    if (RegisterPreferences(env) != JNI_OK) return JNI_ERR;
-    return JNI_VERSION_1_6;
+
+__attribute__((constructor))
+void lib_main() {
+    std::thread(hack_thread).detach();
 }
