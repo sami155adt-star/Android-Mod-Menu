@@ -1,0 +1,35 @@
+# GitHub Actions: LGL Mod Menu টেমপ্লেট বিল্ড করে APK বানায়
+# এই ফাইলটা আপনার রিপোজিটরিতে .github/workflows/build.yml নামে রাখুন।
+name: Build Mod Menu
+on:
+  workflow_dispatch:      # Actions ট্যাব থেকে "Run workflow" চাপলে চলবে
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install NDK
+        run: |
+          yes | sdkmanager --licenses > /dev/null || true
+          sdkmanager "ndk;25.2.9519653" "cmake;3.22.1" || true
+
+      - name: Build
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: modmenu-apk
+          path: |
+            **/build/outputs/apk/**/*.apk
