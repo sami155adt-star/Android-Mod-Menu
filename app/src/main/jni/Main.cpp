@@ -1,281 +1,257 @@
-#include <list>
-#include <vector>
-#include <cstring>
-#include <pthread.h>
-#include <thread>
-#include <cstring>
-#include <string>
+// FFI offline game - LGL Mod Menu (Android-Mod-Menu) এর jni/Main.cpp
+// dump.cs থেকে পাওয়া আসল ক্লাস/মেথডের নাম বসানো আছে। অফসেট নয়, নাম দিয়ে ফাংশন খোঁজা হয়।
+// অনুমান/ঝুঁকির জায়গাগুলোয় "CHECK:" লেখা আছে।
+//
+// গেমের "গ্লোবাল" = Gloo Wall (PlayerController.WallCount, AddGlooWalls)
+// লবির Coin/Diamond = MenuController.CoinTransation / DimondTransation (শুধু লবিতে কাজ করবে)
+// ম্যাচের ভেতরের টাকা = GameManager.AddMoney (CS মোডের টাকা)
+
 #include <jni.h>
-#include <unistd.h>
-#include <fstream>
-#include <iostream>
 #include <dlfcn.h>
+#include <pthread.h>
+#include <unistd.h>
+#include <string>
+#include <vector>
+#include <cstdlib>
 #include "Includes/Logger.h"
 #include "Includes/obfuscate.h"
-#include "Includes/Utils.hpp"
-#include "Menu/Menu.hpp"
-#include "Menu/Jni.hpp"
-#include "Includes/Macros.h"
+#include "Includes/Utils.h"
+#include "Menu.h"
 #include "dobby.h"
 
-int scoreMul = 1, coinsMul = 1;
+#define TAG "FFIMOD"
 
-// Do not change or translate the first text unless you know what you are doing
-// Assigning feature numbers is optional. Without it, it will automatically count for you, starting from 0
-// Assigned feature numbers can be like any numbers 1,3,200,10... instead in order 0,1,2,3,4,5...
-// ButtonLink, Category, RichTextView and RichWebView is not counted. They can't have feature number assigned
-// Toggle, ButtonOnOff and Checkbox can be switched on by default, if you add True_. Example: CheckBox_True_The Check Box
-// To learn HTML, go to this page: https://www.w3schools.com/
+// ---------- IL2CPP API ----------
+typedef void*  (*t_void)();
+typedef void** (*t_asms)(void*, size_t*);
+typedef void*  (*t_p1)(void*);
+typedef void*  (*t_cls)(void*, const char*, const char*);
+typedef void*  (*t_meth)(void*, const char*, int);
+typedef void*  (*t_field)(void*, const char*);
+typedef void   (*t_sget)(void*, void*);
+static t_void il2cpp_domain_get;      static t_asms il2cpp_domain_get_assemblies;
+static t_p1   il2cpp_assembly_get_image, il2cpp_thread_attach, il2cpp_class_get_type, il2cpp_type_get_object;
+static t_cls  il2cpp_class_from_name; static t_meth il2cpp_class_get_method_from_name;
+static t_field il2cpp_class_get_field_from_name; static t_sget il2cpp_field_static_get_value;
 
+static void* FindClass(const char* cls) {
+    size_t n = 0; void** a = il2cpp_domain_get_assemblies(il2cpp_domain_get(), &n);
+    for (size_t i = 0; i < n; i++) {
+        void* k = il2cpp_class_from_name(il2cpp_assembly_get_image(a[i]), "", cls);
+        if (k) return k;
+    }
+    return nullptr;
+}
+static void* FindMethodNS(const char* ns, const char* cls, const char* m, int argc) {
+    size_t n = 0; void** a = il2cpp_domain_get_assemblies(il2cpp_domain_get(), &n);
+    for (size_t i = 0; i < n; i++) {
+        void* k = il2cpp_class_from_name(il2cpp_assembly_get_image(a[i]), ns, cls);
+        if (!k) continue;
+        void** mi = (void**) il2cpp_class_get_method_from_name(k, m, argc);
+        if (mi) return *mi;
+    }
+    LOGE("method not found: %s::%s", cls, m);
+    return nullptr;
+}
+static void* FindMethod(const char* cls, const char* m, int argc) { return FindMethodNS("", cls, m, argc); }
+
+// static ফিল্ড পড়া (যেমন MenuController.instance)
+static void* GetStatic(const char* cls, const char* field) {
+    void* k = FindClass(cls); if (!k) return nullptr;
+    void* f = il2cpp_class_get_field_from_name(k, field); if (!f) return nullptr;
+    void* out = nullptr; il2cpp_field_static_get_value(f, &out); return out;
+}
+
+// ---------- অবস্থা ----------
+static bool oneHitKill, unlimitedHealth, unlimitedGloo;
+static int  gunSlot = 0, gunNumber = 0;
+
+struct V3 { float x, y, z; };
+struct Q4 { float x, y, z, w; };
+
+static void* LocalPlayerHealth() { return GetStatic("GameManager", "NewPlayer"); } // CHECK: NewPlayer = নিজের খেলোয়াড় কিনা
+
+// ---------- হুক ----------
+// Unlimited Health (শুধু নিজের PlayerHealth এ)
+void (*old_GetDamage)(void*, int, uint8_t, void*);
+void new_GetDamage(void* self, int d, uint8_t actor, void* mi) {
+    if (unlimitedHealth && self == LocalPlayerHealth()) return;
+    old_GetDamage(self, d, actor, mi);
+}
+void (*old_ApplyDamagePlayer)(void*, int, uint8_t, V3, Q4, void*);
+void new_ApplyDamagePlayer(void* self, int d, uint8_t actor, V3 p, Q4 r, void* mi) {
+    if (unlimitedHealth && self == LocalPlayerHealth()) return;
+    old_ApplyDamagePlayer(self, d, actor, p, r, mi);
+}
+
+// One Hit Kill: শুধু যখন আঘাতকারী প্লেয়ার (isPlayer=true), বটের ক্ষতি বিশাল করা
+void (*old_AI_TakeDamage)(void*, int16_t, uint8_t, bool, void*);
+void new_AI_TakeDamage(void* self, int16_t a, uint8_t actor, bool isPlayer, void* mi) {
+    old_AI_TakeDamage(self, (oneHitKill && isPlayer) ? (int16_t) 30000 : a, actor, isPlayer, mi);
+}
+void (*old_AI_TakeDamagePV)(void*, int16_t, uint8_t, bool, void*);
+void new_AI_TakeDamagePV(void* self, int16_t a, uint8_t actor, bool isPlayer, void* mi) {
+    old_AI_TakeDamagePV(self, (oneHitKill && isPlayer) ? (int16_t) 30000 : a, actor, isPlayer, mi);
+}
+void (*old_AI_ApplyDamage)(void*, int, uint8_t, bool, void*);
+void new_AI_ApplyDamage(void* self, int a, uint8_t actor, bool isPlayer, void* mi) {
+    old_AI_ApplyDamage(self, (oneHitKill && isPlayer) ? 30000 : a, actor, isPlayer, mi);
+}
+
+// Unlimited Gloo: PlayerController.Update এ প্রতি ফ্রেমে চেক
+static void (*AddGlooWalls)(void*, int, void*);
+void (*old_PC_Update)(void*, void*);
+void new_PC_Update(void* self, void* mi) {
+    old_PC_Update(self, mi);
+    if (unlimitedGloo && AddGlooWalls) {
+        int cur = *(int*)((char*)self + 0x2CC);           // WallCount
+        if (cur < 20) AddGlooWalls(self, 20 - cur, nullptr); // 0 থাকলেও সাথে সাথে বাটন দেখাবে
+    }
+}
+
+// ---------- দরকারি মেথড ----------
+static void (*CoinTransation)(void*, int, int, void*);
+static void (*DimondTransation)(void*, int, int, void*);
+static void (*GM_AddMoney)(void*, int, void*);
+static void (*AddMedkitsCS)(void*, int, void*);
+static void (*SetGun)(void*, int, void*, void*);          // Inventory.SetGun(int type, WeaponData)
+static void* (*FindObjectsOfTypeAll)(void*, void*);       // UnityEngine.Resources
+
+// WeaponData তালিকা
+static std::vector<void*> weapons;
+static std::string Str(void* s) {                         // Il2CppString -> std::string
+    if (!s) return "";
+    int len = *(int*)((char*)s + 0x10); uint16_t* c = (uint16_t*)((char*)s + 0x14);
+    std::string r; for (int i = 0; i < len; i++) r += (char) c[i]; return r;
+}
+static void RefreshWeapons() {
+    weapons.clear();
+    void* k = FindClass("WeaponData"); if (!k || !FindObjectsOfTypeAll) return;
+    void* t = il2cpp_type_get_object(il2cpp_class_get_type(k));
+    void* arr = FindObjectsOfTypeAll(t, nullptr);
+    if (!arr) return;
+    size_t n = *(size_t*)((char*)arr + 0x18); void** el = (void**)((char*)arr + 0x20);
+    for (size_t i = 0; i < n; i++) weapons.push_back(el[i]);
+}
+static void PrintWeapons() {
+    RefreshWeapons();
+    for (size_t i = 0; i < weapons.size(); i++)
+        LOGI("[%s] gun #%zu = %s", TAG, i, Str(*(void**)((char*)weapons[i] + 0x28)).c_str()); // WeaponName @0x28
+}
+
+static void Hooks() {
+    void* h; while (!(h = dlopen("libil2cpp.so", RTLD_NOLOAD))) sleep(1);
+    #define SYM(n) n = (decltype(n)) dlsym(h, #n)
+    SYM(il2cpp_domain_get); SYM(il2cpp_domain_get_assemblies); SYM(il2cpp_assembly_get_image);
+    SYM(il2cpp_thread_attach); SYM(il2cpp_class_from_name); SYM(il2cpp_class_get_method_from_name);
+    SYM(il2cpp_class_get_field_from_name); SYM(il2cpp_field_static_get_value);
+    SYM(il2cpp_class_get_type); SYM(il2cpp_type_get_object);
+    sleep(10);
+    il2cpp_thread_attach(il2cpp_domain_get());
+
+    void* a;
+    #define HOOKM(cls, m, argc, nw, old) if ((a = FindMethod(cls, m, argc))) DobbyHook(a, (void*)nw, (void**)&old)
+    HOOKM("PlayerHealth", "GetDamage", 2, new_GetDamage, old_GetDamage);
+    HOOKM("PlayerHealth", "ApplyDamagePlayer", 4, new_ApplyDamagePlayer, old_ApplyDamagePlayer);
+    HOOKM("AIHealth", "TakeDamage", 3, new_AI_TakeDamage, old_AI_TakeDamage);
+    HOOKM("AIHealth", "TakeDamagePV", 3, new_AI_TakeDamagePV, old_AI_TakeDamagePV);
+    HOOKM("AIHealth", "ApplyDamage", 3, new_AI_ApplyDamage, old_AI_ApplyDamage);
+    HOOKM("PlayerController", "Update", 0, new_PC_Update, old_PC_Update);
+
+    AddGlooWalls     = (decltype(AddGlooWalls))     FindMethod("PlayerController", "AddGlooWalls", 1);
+    CoinTransation   = (decltype(CoinTransation))   FindMethod("MenuController", "CoinTransation", 2);
+    DimondTransation = (decltype(DimondTransation)) FindMethod("MenuController", "DimondTransation", 2);
+    GM_AddMoney      = (decltype(GM_AddMoney))      FindMethod("GameManager", "AddMoney", 1);
+    AddMedkitsCS     = (decltype(AddMedkitsCS))     FindMethod("PlayerHealth", "AddMedkitsCS", 1);
+    SetGun           = (decltype(SetGun))           FindMethod("Inventory", "SetGun", 2);
+    FindObjectsOfTypeAll = (decltype(FindObjectsOfTypeAll)) FindMethodNS("UnityEngine", "Resources", "FindObjectsOfTypeAll", 1);
+    LOGI("[%s] hooks ready", TAG);
+}
+void* hack_thread(void*) { Hooks(); return nullptr; }
+
+// ---------- মেনু ----------
 jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
-    jobjectArray ret;
-
     const char *features[] = {
-            OBFUSCATE("Toggle_No death"),
-            OBFUSCATE("Button_Start Invcibility (30 sec duration)"),
-            OBFUSCATE("SeekBar_Score multiplier_1_100"),
-            OBFUSCATE("SeekBar_Coins multiplier_1_1000"),
-            OBFUSCATE("Category_Examples"), //Not counted
-            OBFUSCATE("Toggle_The toggle"),
-            OBFUSCATE(
-                    "100_Toggle_True_The toggle 2"), //This one have feature number assigned, and switched on by default
-            OBFUSCATE("110_Toggle_The toggle 3"), //This one too
-            OBFUSCATE("SeekBar_The slider_1_100"),
-            OBFUSCATE("SeekBar_Kittymemory slider example_1_5"),
-            OBFUSCATE("Spinner_The spinner_Items 1,Items 2,Items 3"),
-            OBFUSCATE("Button_The button"),
-            OBFUSCATE("ButtonLink_The button with link_https://www.youtube.com/"), //Not counted
-            OBFUSCATE("ButtonOnOff_The On/Off button"),
-            OBFUSCATE("CheckBox_The Check Box"),
-            OBFUSCATE("InputValue_Input number"),
-            OBFUSCATE("InputValue_1000_Input number 2"), //Max value
-			OBFUSCATE("1111_InputLValue_Input long number"),
-            OBFUSCATE("InputLValue_1000000000000_Input long number 2"), //Max value
-            OBFUSCATE("InputText_Input text"),
-            OBFUSCATE("RadioButton_Radio buttons_OFF,Mod 1,Mod 2,Mod 3"),
+        OBFUSCATE("Category_PLAYER"),
+        OBFUSCATE("1_Toggle_One Hit Kill"),
+        OBFUSCATE("2_Toggle_Unlimited Health"),
 
-            //Create new collapse
-            OBFUSCATE("Collapse_Collapse 1"),
-            OBFUSCATE("CollapseAdd_Toggle_The toggle"),
-            OBFUSCATE("CollapseAdd_Toggle_The toggle"),
-            OBFUSCATE("123_CollapseAdd_Toggle_The toggle"),
-            OBFUSCATE("122_CollapseAdd_CheckBox_Check box"),
-            OBFUSCATE("CollapseAdd_Button_The button"),
+        OBFUSCATE("Category_ITEMS"),
+        OBFUSCATE("3_Toggle_Unlimited Global (Gloo Wall)"),
+        OBFUSCATE("4_InputValue_Add Global"),
+        OBFUSCATE("5_InputValue_Add Medkit"),
 
-            //Create new collapse again
-            OBFUSCATE("Collapse_Collapse 2_True"),
-            OBFUSCATE("CollapseAdd_SeekBar_The slider_1_100"),
-            OBFUSCATE("CollapseAdd_InputValue_Input number"),
+        OBFUSCATE("Category_WEAPONS"),
+        OBFUSCATE("6_Spinner_Gun Slot_Slot 1,Slot 2,Slot 3"),
+        OBFUSCATE("7_InputValue_Gun Number"),
+        OBFUSCATE("8_Button_Add Gun"),
+        OBFUSCATE("9_Button_Print Gun List (logcat)"),
 
-            OBFUSCATE("RichTextView_This is text view, not fully HTML."
-                      "<b>Bold</b> <i>italic</i> <u>underline</u>"
-                      "<br />New line <font color='red'>Support colors</font>"
-                      "<br/><big>bigger Text</big>"),
-            OBFUSCATE("RichWebView_<html><head><style>body{color: white;}</style></head><body>"
-                      "This is WebView, with REAL HTML support!"
-                      "<div style=\"background-color: darkblue; text-align: center;\">Support CSS</div>"
-                      "<marquee style=\"color: green; font-weight:bold;\" direction=\"left\" scrollamount=\"5\" behavior=\"scroll\">This is <u>scrollable</u> text</marquee>"
-                      "</body></html>")
+        OBFUSCATE("Category_CURRENCY"),
+        OBFUSCATE("10_InputValue_Add/Remove Money (Lobby)"),
+        OBFUSCATE("11_InputValue_Add/Remove Diamond (Lobby)"),
+        OBFUSCATE("12_InputValue_Add Money (In Match)"),
     };
-
-    int Total_Feature = (sizeof features / sizeof features[0]);
-    ret = (jobjectArray)
-            env->NewObjectArray(Total_Feature, env->FindClass(OBFUSCATE("java/lang/String")),
-                                env->NewStringUTF(""));
-
-    for (int i = 0; i < Total_Feature; i++)
-        env->SetObjectArrayElement(ret, i, env->NewStringUTF(features[i]));
-
-    return (ret);
+    int n = sizeof(features) / sizeof(features[0]);
+    jobjectArray ret = env->NewObjectArray(n, env->FindClass(OBFUSCATE("java/lang/String")), env->NewStringUTF(""));
+    for (int i = 0; i < n; i++) env->SetObjectArrayElement(ret, i, env->NewStringUTF(features[i]));
+    return ret;
 }
 
-bool btnPressed = false;
-
-//Target main lib here
-#define targetLibName OBFUSCATE("libil2cpp.so")
-
-void Changes(JNIEnv *env, jclass clazz, jobject obj, jint featNum, jstring featName, jint value, jlong Lvalue, jboolean boolean, jstring text) {
-
+void Changes(JNIEnv *env, jclass clazz, jobject obj, jint featNum, jstring featName, jint value,
+             jboolean boolean, jstring str) {
     switch (featNum) {
-        case 0:
-            // offset, hex
-            PATCH_SWITCH(targetLibName, "0x1079728", "C0 03 5F D6", boolean);
-            // The patch switch has been returned and reworked:
-            // - (active) Dobby-Kitty implementation
-            // - reworked KittyMemory implementation
-            //
-            // if you encounter any problems:
-            // - switch to Kitty implementation (uncomment code in Macros.h)
-            // - uncommiting logging for detailed debug
-            // - special attention to the preferences -> this is the only source of this problem in the past that I have noticed:
-            // -- try rename the preferences file;
-            // -- for a maximum stable and flexible save settings, recommend using own system with XML/JSON files.
-
-            // alt possibles usage variants:
-            // symbol, hex
-            PATCH_SWITCH(targetLibName, "_example__sym", "C0 03 5F D6", boolean);
-            // offset, asm
-            PATCH_SWITCH(targetLibName, "0x1079728", "ret", boolean);
-            // symbol, asm
-            PATCH_SWITCH(targetLibName, "_example__sym", "ret", boolean);
-
-            // asm allows you to avoid using hex code, as it is generated automatically from the instructions.
-            // - this is the awesome option if you know what you're doing
-            // recommended insert ';' to separate statements, example: "mov x0, #1; ret"
-            // recommended to test your instructions on https://armconverter.com or
-            // https://shell-storm.org/online/Online-Assembler-and-Disassembler/
-
-            // - this is probably especially useful with creating dynamic deep patches
-            dPATCH_SWITCH(true, targetLibName, "0x1079728", "mov w%d, #%d", 0, 222);
-            dPATCH_SWITCH(true, targetLibName, "_example__sym", "mov w%d, #%d", 0, 222);
-            // standard formatting specifiers are supported (%d, %i, %x, %s, etc.)
-
-
-            // Relative patches allow you to speed up patch creation if you are sure that the offsets within methods rarely change
-            // So, you only need to update the offset instruction for the function
-            // https://www.rapidtables.com/calc/math/hex-calculator.html <- use hex calculator to calculate the offset relative to the method
-            // ! This is an extremely unstable due to the hard offsets... don't forget to check the logs to identify outdated offsets
-            // offset, offset, hex
-            rPATCH_SWITCH(targetLibName, "0x1079728", "0x204", "C0 03 5F D6", boolean);
-            // sym, offset, hex
-            rPATCH_SWITCH(targetLibName, "_example__sym", "0xAC", "C0 03 5F D6", boolean);
-            // offset, offset, asm
-            rPATCH_SWITCH(targetLibName, "0x1079728", "0x204", "mov x0, #0xffffff; ret", boolean);
-            // sym, offset, asm
-            rPATCH_SWITCH(targetLibName, "_example__sym", "0xAC", "mov x0, #0xffffff; ret", boolean);
-            break;
-        case 4:
-            if(boolean) {
-                // offset, hex
-                PATCH(targetLibName, "0x10709AC", "E05F40B2 C0035FD6");
-                rPATCH(targetLibName, "0x107094D", "0x5F", "E05F40B2 C0035FD6");
-
-                // alt possibles usage variants:
-                // symbol, hex
-                PATCH(targetLibName, "_example__sym", "E0 5F 40 B2 C0 03 5F D6");
-                rPATCH(targetLibName, "_example__sym", "0x5F", "E0 5F 40 B2 C0 03 5F D6");
-                // offset, asm
-                PATCH(targetLibName, "0x10709AC", "mov x0, #0xffffff; ret");
-                rPATCH(targetLibName, "0x107094D", "0x5F", "mov x0, #0xffffff; ret");
-                // symbol, asm
-                PATCH(targetLibName, "_example__sym", "mov x0, #0xffffff; ret");
-                rPATCH(targetLibName, "_example__sym", "0x5F", "mov x0, #0xffffff; ret");
-            } else {
-                RESTORE(targetLibName, "0x10709AC");
-                rRESTORE(targetLibName, "0x10709AC", "0x5F");
-                // or
-                RESTORE(targetLibName, "_example__sym");
-                rRESTORE(targetLibName, "_example__sym", "0x5F");
-            }
-            break;
-        case 1:
-            btnPressed = true;
-            break;
-        case 2:
-            scoreMul = value;
-            break;
-        case 3:
-            coinsMul = value;
-            break;
-        case 5:
-            // you can use this for things as detect log, counting function calls, executing side code before the function is executed
-            // now instrument wrapper implemented for detecting execution in logcat
-            INST(targetLibName, "0x235630", "AnyNameForDetect2", boolean);
-
-            if(boolean) {
-                INST(targetLibName, "_example__sym", "AnyNameForDetect3", true);
-            } else {
-                INST(targetLibName, "_example__sym", "AnyNameForDetect3", false);
-            }
-            break;
-        default:
-            break;
+        case 1: oneHitKill = boolean; break;
+        case 2: unlimitedHealth = boolean; break;
+        case 3: unlimitedGloo = boolean; break;
+        case 4: { void* p = LocalPlayerHealth(); if (p && AddGlooWalls) {
+                    void* ctrl = *(void**)((char*)p + 0x30);     // PlayerHealth.Controller
+                    if (ctrl) AddGlooWalls(ctrl, value, nullptr); } break; }
+        case 5: { void* p = LocalPlayerHealth(); if (p && AddMedkitsCS) AddMedkitsCS(p, value, nullptr); break; }
+        case 6: gunSlot = value; break;
+        case 7: gunNumber = value; break;
+        case 8: { void* inv = GetStatic("Inventory", "Singleton");
+                  RefreshWeapons();
+                  if (inv && SetGun && gunNumber >= 0 && gunNumber < (int) weapons.size())
+                      SetGun(inv, gunSlot, weapons[gunNumber], nullptr);
+                  break; }
+        case 9: PrintWeapons(); break;
+        case 10: { void* m = GetStatic("MenuController", "instance");
+                   if (m && CoinTransation) CoinTransation(m, value >= 0 ? 0 : 1, abs(value), nullptr); break; }
+        case 11: { void* m = GetStatic("MenuController", "instance");
+                   if (m && DimondTransation) DimondTransation(m, value >= 0 ? 0 : 1, abs(value), nullptr); break; }
+        case 12: { void* g = GetStatic("GameManager", "instance");   // CHECK: static ফিল্ডের নাম (instance/Instance) যাচাই করুন
+                   if (g && GM_AddMoney) GM_AddMoney(g, value, nullptr); break; }
     }
 }
 
-//CharacterPlayer
-void (*StartInvcibility)(void *instance, float duration);
+// ---------- JNI (LGL টেমপ্লেটের মতোই) ----------
+__attribute__((constructor)) void lib_main() { pthread_t t; pthread_create(&t, nullptr, hack_thread, nullptr); }
 
-void (*old_Update)(void *instance);
-void Update(void *instance) {
-    if (instance != nullptr) {
-        if (btnPressed) {
-            StartInvcibility(instance, 30);
-            btnPressed = false;
-        }
-    }
-    return old_Update(instance);
+int RegisterMenu(JNIEnv *env) {
+    JNINativeMethod methods[] = {
+        {OBFUSCATE("Icon"), OBFUSCATE("()Ljava/lang/String;"), reinterpret_cast<void *>(Icon)},
+        {OBFUSCATE("IconWebViewData"), OBFUSCATE("()Ljava/lang/String;"), reinterpret_cast<void *>(IconWebViewData)},
+        {OBFUSCATE("IsGameLibLoaded"), OBFUSCATE("()Z"), reinterpret_cast<void *>(isGameLibLoaded)},
+        {OBFUSCATE("Init"), OBFUSCATE("(Landroid/content/Context;Landroid/widget/TextView;Landroid/widget/TextView;)V"), reinterpret_cast<void *>(Init)},
+        {OBFUSCATE("SettingsList"), OBFUSCATE("()[Ljava/lang/String;"), reinterpret_cast<void *>(SettingsList)},
+        {OBFUSCATE("GetFeatureList"), OBFUSCATE("()[Ljava/lang/String;"), reinterpret_cast<void *>(GetFeatureList)},
+    };
+    jclass c = env->FindClass(OBFUSCATE("com/android/support/Menu"));
+    if (!c) return JNI_ERR;
+    return env->RegisterNatives(c, methods, sizeof(methods) / sizeof(methods[0])) != 0 ? JNI_ERR : JNI_OK;
 }
-
-/*
- void (*old_AddScore)(void *instance, int score);
- void AddScore(void *instance, int score) {
-    //default any actions
-    return old_AddScore(instance, score * scoreMul);
- }
-*/
-// === This function was completely replaced with `install_hook_name` from dobby.h ===
-// (base name, return type, ... args)
-install_hook_name(AddScore, void *, void *instance, int score) {
-    // default any actions
-
-    // use orig_ for call original function
-    return orig_AddScore(instance, score + scoreMul);
+int RegisterPreferences(JNIEnv *env) {
+    JNINativeMethod methods[] = {
+        {OBFUSCATE("Changes"), OBFUSCATE("(Landroid/content/Context;ILjava/lang/String;IZLjava/lang/String;)V"), reinterpret_cast<void *>(Changes)},
+    };
+    jclass c = env->FindClass(OBFUSCATE("com/android/support/Preferences"));
+    if (!c) return JNI_ERR;
+    return env->RegisterNatives(c, methods, sizeof(methods) / sizeof(methods[0])) != 0 ? JNI_ERR : JNI_OK;
 }
-
-void (*old_AddCoins)(void *instance, int count);
-void AddCoins(void *instance, int count) {
-    return old_AddCoins(instance, count * coinsMul);
-}
-
-
-// we will run our hacks in a new thread so our while loop doesn't block process main thread
-void hack_thread() {
-    // This loop should be always enabled in unity game
-    // because libil2cpp.so is not loaded into memory immediately.
-    while (!isLibraryLoaded(targetLibName)) {
-        sleep(1); // Wait for target lib be loaded.
-    }
-
-    // In Android Studio, to switch between arm64-v8a and armeabi-v7a syntax highlighting,
-    // You can modify the "Active ABI" in "Build Variants" to switch to another architecture for parsing.
-#if defined(__aarch64__)
-    //Il2Cpp: Use RVA offset
-    StartInvcibility = (void (*)(void *, float)) getAbsoluteAddress(targetLibName, OBFUSCATE("0x107A3BC"));
-    StartInvcibility = (void (*)(void *, float)) getAbsoluteAddress(targetLibName, OBFUSCATE("_characterPlayer_Update"));
-
-    HOOK(targetLibName, "0x107A2FC", AddCoins, old_AddCoins);
-
-    // HOOK(targetLibName, "0x107A2E0", AddScore, old_AddScore);
-    // === This function was completely replaced with super-macro `install_hook_name` from dobby.h ===
-    // don't forget set address for install_hook:
-    // ! getAbsoluteAddress not have OBFUSCATE, so don't forget use his here
-    install_hook_AddScore(getAbsoluteAddress(targetLibName,OBFUSCATE("0x107A2E0")));
-
-    HOOK(targetLibName, "0x1078C44", Update, old_Update);
-    //HOOK(targetLibName, "0x1079728", Kill, old_Kill);
-    //HOOK(targetLibName, "_example__sym", Kill, old_Kill);
-    //HOOK_NO_ORIG("libFileC.so", "0x123456", FunctionExample);
-    //HOOK_NO_ORIG("libFileC.so", "_example__sym", FunctionExample);
-
-    //PATCH(targetLibName, "0x10709AC", "E05F40B2C0035FD6");
-
-    INST(targetLibName, "0x23558C", "AnyNameForDetect", true);
-
-    // LOGI(OBFUSCATE("Test SYM: 0x%llx"), (uintptr_t)getAbsoluteAddress(OBFUSCATE("libil2cpp.so"), OBFUSCATE("il2cpp_init")));
-#elif defined(__arm__)
-    //Put your code here if you want the code to be compiled for armv7 only
-#endif
-
-    LOGI(OBFUSCATE("Done"));
-}
-
-// Functions with `__attribute__((constructor))` are executed immediately when System.loadLibrary("lib_name") is called.
-// If there are multiple such functions at the same time, `constructor(priority)` (the priority is an integer)
-// will determine the execution priority, otherwise the execution order is undefined behavior.
-__attribute__((constructor))
-void lib_main() {
-    // Create a new thread so it does not block the main thread, means the game would not freeze
-    // In modern C++, you should use std::thread(yourFunction).detach() instead of pthread_create
-    std::thread(hack_thread).detach();
+extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
+    JNIEnv *env; vm->GetEnv((void **) &env, JNI_VERSION_1_6);
+    if (RegisterMenu(env) != JNI_OK) return JNI_ERR;
+    if (RegisterPreferences(env) != JNI_OK) return JNI_ERR;
+    return JNI_VERSION_1_6;
 }
