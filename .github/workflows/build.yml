@@ -1,8 +1,8 @@
 # GitHub Actions: LGL Mod Menu টেমপ্লেট বিল্ড করে APK বানায়
-# এই ফাইলটা আপনার রিপোজিটরিতে .github/workflows/build.yml নামে রাখুন।
+# gradle-wrapper.jar না থাকলেও চলে: Gradle নিজে ইনস্টল করা হয়।
 name: Build Mod Menu
 on:
-  workflow_dispatch:      # Actions ট্যাব থেকে "Run workflow" চাপলে চলবে
+  workflow_dispatch:
   push:
     branches: [ main, master ]
 
@@ -17,15 +17,18 @@ jobs:
           distribution: temurin
           java-version: 17
 
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.14.3
+
       - name: Install NDK
         run: |
           yes | sdkmanager --licenses > /dev/null || true
           sdkmanager "ndk;25.2.9519653" "cmake;3.22.1" || true
 
       - name: Build
-        run: |
-          chmod +x ./gradlew
-          ./gradlew assembleDebug --no-daemon --stacktrace
+        run: gradle assembleDebug --no-daemon --stacktrace
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
