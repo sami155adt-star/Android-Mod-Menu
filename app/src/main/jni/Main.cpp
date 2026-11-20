@@ -18,6 +18,7 @@
 #include <iostream>
 #include <dlfcn.h>
 #include <mutex>
+#include <algorithm>
 #include <functional>
 #include <cstdlib>
 #include "Includes/Logger.h"
@@ -163,6 +164,8 @@ static void (*DimondTransation)(void*, int, int, void*);
 static void (*GM_AddMoney)(void*, int, void*);
 static void (*AddMedkitsCS)(void*, int, void*);
 static void (*PC_GetItem)(void*, void*, void*);              // PlayerController.GetItem(WeaponData)
+static void (*InvSpawnOut)(void*, void*, void*);              // Inventory.SpawnInventoryItemFromOutsid(Item)
+static void (*InvSpawnOutUI)(void*, void*, void*);            // Inventory.SpawnInventoryItemFromOutsidUI(Item)
 static void (*InvSetGun)(void*, int, void*, void*);          // Inventory.SetGun(int type, WeaponData)
 static void* (*FindObjectsOfTypeAll)(void*, void*);          // UnityEngine.Resources
 
@@ -172,34 +175,42 @@ static std::string m_Str(void* s) {
     int len = *(int*)((char*)s + 0x10); uint16_t* c = (uint16_t*)((char*)s + 0x14);
     std::string r; for (int i = 0; i < len; i++) r += (char) c[i]; return r;
 }
+static std::string WName(void* d) { return m_Str(*(void**)((char*)d + 0x28)); }   // WeaponData.WeaponName
+static void AddWD(void* d) {
+    if (!d) return;
+    std::string n = WName(d);
+    if (n.empty()) return;
+    for (void* x : weapons) if (WName(x) == n) return;                                  // একই নাম দুবার নয়
+    weapons.push_back(d);
+}
+static void AddArr(void* arr, size_t cap, int dataOff) {        // Il2Cpp array; dataOff: 0 = সরাসরি WeaponData, নইলে Weapon.data এর অফসেট
+    if (!arr) return;
+    size_t n = *(size_t*)((char*)arr + 0x18); void** el = (void**)((char*)arr + 0x20);
+    for (size_t i = 0; i < n && i < cap; i++) {
+        if (!el[i]) continue;
+        AddWD(dataOff ? *(void**)((char*)el[i] + dataOff) : el[i]);
+    }
+}
+static void AddList(void* list) {                                // List<WeaponData>
+    if (!list) return;
+    void* items = *(void**)((char*)list + 0x10); int size = *(int*)((char*)list + 0x18);
+    if (!items) return;
+    void** el = (void**)((char*)items + 0x20);
+    for (int i = 0; i < size && i < 400; i++) AddWD(el[i]);
+}
 static void RefreshWeapons() {
     weapons.clear();
-    // ১) নিজের PlayerController.AllWeapons (Weapon[]) থেকে .data (WeaponData)
-    if (g_pc) {
-        void* arr = *(void**)((char*)g_pc + 0x218);
-        if (arr) {
-            size_t n = *(size_t*)((char*)arr + 0x18); void** el = (void**)((char*)arr + 0x20);
-            for (size_t i = 0; i < n && i < 200; i++) {
-                if (!el[i]) continue;
-                void* d = *(void**)((char*)el[i] + 0x20);     // Weapon.data
-                if (!d) continue;
-                bool dup = false; for (void* x : weapons) if (x == d) dup = true;
-                if (!dup) weapons.push_back(d);
-            }
-        }
-    }
-    // ২) না পেলে: Resources থেকে সব WeaponData
-    if (weapons.empty() && FindObjectsOfTypeAll) {
+    // ১) লোড হওয়া সব WeaponData
+    if (FindObjectsOfTypeAll) {
         void* k = m_FindClass("WeaponData");
-        if (k) {
-            void* t = il2_type_get_object(il2_class_get_type(k));
-            void* arr = FindObjectsOfTypeAll(t, nullptr);
-            if (arr) {
-                size_t n = *(size_t*)((char*)arr + 0x18); void** el = (void**)((char*)arr + 0x20);
-                for (size_t i = 0; i < n && i < 400; i++) if (el[i]) weapons.push_back(el[i]);
-            }
-        }
+        if (k) AddArr(FindObjectsOfTypeAll(il2_type_get_object(il2_class_get_type(k)), nullptr), 600, 0);
     }
+    // ২) নিজের AllWeapons (Weapon[] -> data @0x20)
+    if (g_pc) AddArr(*(void**)((char*)g_pc + 0x218), 200, 0x20);
+    // ৩) GameManager এর তালিকা
+    void* gm = m_GetStatic("GameManager", "instace");
+    if (gm) { AddList(*(void**)((char*)gm + 0x1E0)); AddArr(*(void**)((char*)gm + 0xF0), 200, 0); }
+    std::sort(weapons.begin(), weapons.end(), [](void* a, void* b) { return WName(a) < WName(b); });
 }
 static void PrintWeapons() {
     RefreshWeapons();
@@ -210,6 +221,15 @@ static void PrintWeapons() {
 // ---------- মূল (Unity) থ্রেডে কাজ চালানোর লাইন ----------
 // মেনুর বাটন Java থ্রেডে চাপা হয়। সেখান থেকে সরাসরি গেমের ফাংশন কল করা অনিরাপদ (ক্র্যাশের কারণ)।
 // তাই কাজগুলো লাইনে রাখা হয় এবং গেমের নিজের Update এর ভেতর থেকে চালানো হয়।
+static void* CurInventory() {
+    void* idt = m_GetStatic("InventoryData", "inventoryData");
+    if (idt) { void* c = *(void**)((char*)idt + 0x28); if (c) return c; }    // InventoryData.CurrentInventory
+    return m_GetStatic("Inventory", "Singleton");
+}
+static void* GunItemOf(void* wd) {                                           // WeaponData.itemData(0x30) -> PickUPItem.PickItem(0x38)
+    void* pu = *(void**)((char*)wd + 0x30);
+    return pu ? *(void**)((char*)pu + 0x38) : nullptr;
+}
 static std::mutex qMtx;
 static std::vector<std::function<void()>> qTasks;
 static std::mutex gnMtx;
@@ -264,6 +284,14 @@ static void DoAction(int id, int value, bool on) {
                     void* inv = m_GetStatic("Inventory", "Singleton");
                     if (weapons.empty()) RefreshWeapons();
                     if (inv && InvSetGun && idx >= 0 && idx < (int) weapons.size()) InvSetGun(inv, slot, weapons[idx], nullptr); }); break;
+        case 14: PostTask([value]() { int idx = value % 1000;                  // পদ্ধতি C: ইনভেন্টরিতে আইটেম বসানো
+                    if (weapons.empty()) RefreshWeapons();
+                    void* inv = CurInventory();
+                    if (inv && InvSpawnOut && idx >= 0 && idx < (int) weapons.size()) { void* it = GunItemOf(weapons[idx]); if (it) InvSpawnOut(inv, it, nullptr); } }); break;
+        case 15: PostTask([value]() { int idx = value % 1000;                  // পদ্ধতি D: UI সংস্করণ
+                    if (weapons.empty()) RefreshWeapons();
+                    void* inv = CurInventory();
+                    if (inv && InvSpawnOutUI && idx >= 0 && idx < (int) weapons.size()) { void* it = GunItemOf(weapons[idx]); if (it) InvSpawnOutUI(inv, it, nullptr); } }); break;
         case 9: PostTask([]() { BuildGunNames(); }); break;
         case 10: PostTask([value]() { void* m = m_GetStatic("MenuController", "instance");
                     if (m && CoinTransation) CoinTransation(m, value >= 0 ? 0 : 1, abs(value), nullptr); }); break;
@@ -281,7 +309,7 @@ static std::string StatusText() {
     snprintf(b, sizeof b, "PlayerHook:%s ticks=%lu | MenuHook:%s ticks=%lu | player:%s | guns:%d | gloo:%s medkit:%s gun:%s",
              pcHookOk ? "OK" : "NOT FOUND", pcTicks, mcHookOk ? "OK" : "NOT FOUND", mcTicks,
              g_ph ? "found" : "none", (int) weapons.size(),
-             AddGlooWalls ? "ok" : "no", AddMedkitsCS ? "ok" : "no", PC_GetItem ? "ok" : "no");
+             AddGlooWalls ? "ok" : "no", AddMedkitsCS ? "ok" : "no", InvSpawnOut ? "ok" : "no");
     return std::string(b);
 }
 extern "C" {
@@ -375,6 +403,8 @@ void hack_thread() {
     InvSetGun        = (decltype(InvSetGun))        m_FindMethod("Inventory", "SetGun", 2);
     FindObjectsOfTypeAll = (decltype(FindObjectsOfTypeAll)) m_FindMethodNS("UnityEngine", "Resources", "FindObjectsOfTypeAll", 1);
     FindObjectsOfType    = (decltype(FindObjectsOfType))    m_FindMethodNS("UnityEngine", "Object", "FindObjectsOfType", 1);
+    InvSpawnOut          = (decltype(InvSpawnOut))          m_FindMethod("Inventory", "SpawnInventoryItemFromOutsid", 1);
+    InvSpawnOutUI        = (decltype(InvSpawnOutUI))        m_FindMethod("Inventory", "SpawnInventoryItemFromOutsidUI", 1);
     PC_GetItem           = (decltype(PC_GetItem))           m_FindMethodNS("WeirdBrothers", "PlayerController", "GetItem", 1);
     if (il2_thread_detach && myThread) il2_thread_detach(myThread);   // থ্রেড শেষ হওয়ার আগে ডিটাচ (ক্র্যাশ এড়াতে)
 #endif
