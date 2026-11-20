@@ -77,6 +77,8 @@ static void* m_GetStatic(const char* cls, const char* field) {
 static bool oneHitKill = false, unlimitedHealth = false, unlimitedGloo = false, unlimitedAmmo = false;
 static void *g_pc = nullptr, *g_ph = nullptr;   // নিজের PlayerController / PlayerHealth (PlayerController.Update এর self)
 static int  g_frame = 0;
+static bool pcHookOk = false, mcHookOk = false;
+static unsigned long pcTicks = 0, mcTicks = 0;
 static int  gunSlot = 0, gunNumber = 0;
 
 static void RunQueue();
@@ -120,6 +122,7 @@ static void (*old_PC_Update)(void*, void*);
 static void new_PC_Update(void* self, void* mi) {
     old_PC_Update(self, mi);
     g_pc = self;
+    pcTicks++;
     g_ph = *(void**)((char*)self + 0x60);                      // PlayerController.playerHealth
     RunQueue();
     g_frame++;
@@ -152,7 +155,7 @@ static void new_PC_Update(void* self, void* mi) {
 }
 
 static void (*old_MC_Update)(void*, void*);
-static void new_MC_Update(void* self, void* mi) { old_MC_Update(self, mi); RunQueue(); }
+static void new_MC_Update(void* self, void* mi) { old_MC_Update(self, mi); mcTicks++; RunQueue(); }
 
 // ---------- দরকারি মেথড ----------
 static void (*CoinTransation)(void*, int, int, void*);
@@ -273,7 +276,16 @@ static void DoAction(int id, int value, bool on) {
 }
 
 // নতুন FfiMenu (Java) এর native ফাংশন
+static std::string StatusText() {
+    char b[256];
+    snprintf(b, sizeof b, "PlayerHook:%s ticks=%lu | MenuHook:%s ticks=%lu | player:%s | guns:%d | gloo:%s medkit:%s gun:%s",
+             pcHookOk ? "OK" : "NOT FOUND", pcTicks, mcHookOk ? "OK" : "NOT FOUND", mcTicks,
+             g_ph ? "found" : "none", (int) weapons.size(),
+             AddGlooWalls ? "ok" : "no", AddMedkitsCS ? "ok" : "no", PC_GetItem ? "ok" : "no");
+    return std::string(b);
+}
 extern "C" {
+JNIEXPORT jstring JNICALL Java_com_ffimod_FfiMenu_nStatus(JNIEnv* env, jclass) { return env->NewStringUTF(StatusText().c_str()); }
 JNIEXPORT void JNICALL Java_com_ffimod_FfiMenu_nToggle(JNIEnv*, jclass, jint id, jboolean on) { DoAction(id, 0, on); }
 JNIEXPORT void JNICALL Java_com_ffimod_FfiMenu_nAction(JNIEnv*, jclass, jint id, jint value) { DoAction(id, value, true); }
 JNIEXPORT jstring JNICALL Java_com_ffimod_FfiMenu_nGunNames(JNIEnv* env, jclass) {
@@ -348,10 +360,14 @@ void hack_thread() {
     sleep(10);                                           // গেম পুরো লোড হতে দিন
     void* myThread = il2_thread_attach(il2_domain_get());
 
-    HookIt(m_FindMethod("MenuController", "Update", 0), (void*) new_MC_Update, (void**) &old_MC_Update);
-    HookIt(m_FindMethod("PlayerController", "Update", 0), (void*) new_PC_Update, (void**) &old_PC_Update);
+    void* mcUpd = m_FindMethod("MenuController", "Update", 0);
+    mcHookOk = (mcUpd != nullptr);
+    HookIt(mcUpd, (void*) new_MC_Update, (void**) &old_MC_Update);
+    void* pcUpd = m_FindMethodNS("WeirdBrothers", "PlayerController", "Update", 0);
+    pcHookOk = (pcUpd != nullptr);
+    HookIt(pcUpd, (void*) new_PC_Update, (void**) &old_PC_Update);
 
-    AddGlooWalls     = (decltype(AddGlooWalls))     m_FindMethod("PlayerController", "AddGlooWalls", 1);
+    AddGlooWalls     = (decltype(AddGlooWalls))     m_FindMethodNS("WeirdBrothers", "PlayerController", "AddGlooWalls", 1);
     CoinTransation   = (decltype(CoinTransation))   m_FindMethod("MenuController", "CoinTransation", 2);
     DimondTransation = (decltype(DimondTransation)) m_FindMethod("MenuController", "DimondTransation", 2);
     GM_AddMoney      = (decltype(GM_AddMoney))      m_FindMethod("GameManager", "AddMoney", 1);
@@ -359,7 +375,7 @@ void hack_thread() {
     InvSetGun        = (decltype(InvSetGun))        m_FindMethod("Inventory", "SetGun", 2);
     FindObjectsOfTypeAll = (decltype(FindObjectsOfTypeAll)) m_FindMethodNS("UnityEngine", "Resources", "FindObjectsOfTypeAll", 1);
     FindObjectsOfType    = (decltype(FindObjectsOfType))    m_FindMethodNS("UnityEngine", "Object", "FindObjectsOfType", 1);
-    PC_GetItem           = (decltype(PC_GetItem))           m_FindMethod("PlayerController", "GetItem", 1);
+    PC_GetItem           = (decltype(PC_GetItem))           m_FindMethodNS("WeirdBrothers", "PlayerController", "GetItem", 1);
     if (il2_thread_detach && myThread) il2_thread_detach(myThread);   // থ্রেড শেষ হওয়ার আগে ডিটাচ (ক্র্যাশ এড়াতে)
 #endif
     LOGI(OBFUSCATE("FFIMOD hooks ready"));
