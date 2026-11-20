@@ -74,14 +74,16 @@ static void* m_GetStatic(const char* cls, const char* field) {
 }
 
 // ---------- অবস্থা ----------
-static bool oneHitKill = false, unlimitedHealth = false, unlimitedGloo = false;
+static bool oneHitKill = false, unlimitedHealth = false, unlimitedGloo = false, unlimitedAmmo = false;
+static void *g_pc = nullptr, *g_ph = nullptr;   // নিজের PlayerController / PlayerHealth (PlayerController.Update এর self)
+static int  g_frame = 0;
 static int  gunSlot = 0, gunNumber = 0;
 
 static void RunQueue();
 struct V3 { float x, y, z; };
 struct Q4 { float x, y, z, w; };
 
-static void* LocalPlayerHealth() { return m_GetStatic("GameManager", "NewPlayer"); } // CHECK: NewPlayer = নিজের খেলোয়াড়?
+static void* LocalPlayerHealth() { return g_ph; }
 
 // ---------- হুক ----------
 // Unlimited Health
@@ -112,13 +114,40 @@ static void new_AI_ApplyDamage(void* self, int a, uint8_t actor, bool isPlayer, 
 
 // Unlimited Gloo Wall
 static void (*AddGlooWalls)(void*, int, void*);
+static void* (*FindObjectsOfType)(void*, void*);              // UnityEngine.Object.FindObjectsOfType(Type)
+static void* aiType = nullptr;
 static void (*old_PC_Update)(void*, void*);
 static void new_PC_Update(void* self, void* mi) {
     old_PC_Update(self, mi);
+    g_pc = self;
+    g_ph = *(void**)((char*)self + 0x60);                      // PlayerController.playerHealth
     RunQueue();
+    g_frame++;
+    if (g_ph && unlimitedHealth) {                             // currentHealth = maxHealth
+        *(int*)((char*)g_ph + 0x3C) = *(int*)((char*)g_ph + 0x38);
+    }
+    if (unlimitedAmmo) {                                       // Weapon.currentAmmo / totalAmmo
+        void* w = *(void**)((char*)self + 0x208);              // currentEquipedWeapon
+        if (w) {
+            int mag = *(int*)((char*)w + 0x68);
+            if (mag > 0) *(int*)((char*)w + 0x70) = mag;
+            *(int*)((char*)w + 0x6C) = 999;
+        }
+    }
     if (unlimitedGloo && AddGlooWalls) {
-        int cur = *(int*)((char*)self + 0x2CC);               // PlayerController.WallCount
+        int cur = *(int*)((char*)self + 0x2CC);                // WallCount
         if (cur < 20) AddGlooWalls(self, 20 - cur, nullptr);
+    }
+    if (oneHitKill && (g_frame % 12 == 0) && FindObjectsOfType) {   // শত্রু বটের হেলথ = 1
+        if (!aiType) { void* k = m_FindClass("AIHealth"); if (k) aiType = il2_type_get_object(il2_class_get_type(k)); }
+        if (aiType) {
+            void* arr = FindObjectsOfType(aiType, nullptr);
+            if (arr) {
+                size_t n = *(size_t*)((char*)arr + 0x18); void** el = (void**)((char*)arr + 0x20);
+                for (size_t i = 0; i < n && i < 128; i++)
+                    if (el[i]) *(int16_t*)((char*)el[i] + 0x22) = 1;     // AIHealth.currentHealth
+            }
+        }
     }
 }
 
@@ -130,6 +159,7 @@ static void (*CoinTransation)(void*, int, int, void*);
 static void (*DimondTransation)(void*, int, int, void*);
 static void (*GM_AddMoney)(void*, int, void*);
 static void (*AddMedkitsCS)(void*, int, void*);
+static void (*PC_GetItem)(void*, void*, void*);              // PlayerController.GetItem(WeaponData)
 static void (*InvSetGun)(void*, int, void*, void*);          // Inventory.SetGun(int type, WeaponData)
 static void* (*FindObjectsOfTypeAll)(void*, void*);          // UnityEngine.Resources
 
@@ -141,17 +171,37 @@ static std::string m_Str(void* s) {
 }
 static void RefreshWeapons() {
     weapons.clear();
-    void* k = m_FindClass("WeaponData"); if (!k || !FindObjectsOfTypeAll) return;
-    void* t = il2_type_get_object(il2_class_get_type(k));
-    void* arr = FindObjectsOfTypeAll(t, nullptr);
-    if (!arr) return;
-    size_t n = *(size_t*)((char*)arr + 0x18); void** el = (void**)((char*)arr + 0x20);
-    for (size_t i = 0; i < n; i++) weapons.push_back(el[i]);
+    // ১) নিজের PlayerController.AllWeapons (Weapon[]) থেকে .data (WeaponData)
+    if (g_pc) {
+        void* arr = *(void**)((char*)g_pc + 0x218);
+        if (arr) {
+            size_t n = *(size_t*)((char*)arr + 0x18); void** el = (void**)((char*)arr + 0x20);
+            for (size_t i = 0; i < n && i < 200; i++) {
+                if (!el[i]) continue;
+                void* d = *(void**)((char*)el[i] + 0x20);     // Weapon.data
+                if (!d) continue;
+                bool dup = false; for (void* x : weapons) if (x == d) dup = true;
+                if (!dup) weapons.push_back(d);
+            }
+        }
+    }
+    // ২) না পেলে: Resources থেকে সব WeaponData
+    if (weapons.empty() && FindObjectsOfTypeAll) {
+        void* k = m_FindClass("WeaponData");
+        if (k) {
+            void* t = il2_type_get_object(il2_class_get_type(k));
+            void* arr = FindObjectsOfTypeAll(t, nullptr);
+            if (arr) {
+                size_t n = *(size_t*)((char*)arr + 0x18); void** el = (void**)((char*)arr + 0x20);
+                for (size_t i = 0; i < n && i < 400; i++) if (el[i]) weapons.push_back(el[i]);
+            }
+        }
+    }
 }
 static void PrintWeapons() {
     RefreshWeapons();
     for (size_t i = 0; i < weapons.size(); i++)
-        LOGI("FFIMOD gun #%zu = %s", i, m_Str(*(void**)((char*)weapons[i] + 0x28)).c_str()); // WeaponName @0x28
+        LOGI("FFIMOD gun #%zu = %s", i, m_Str(*(void**)((char*)weapons[i] + 0x28)).c_str());
 }
 
 // ---------- মূল (Unity) থ্রেডে কাজ চালানোর লাইন ----------
@@ -201,10 +251,13 @@ static void DoAction(int id, int value, bool on) {
         case 1: oneHitKill = on; if (on) PostTask([]() { InstallDamageHooks(); }); break;
         case 2: unlimitedHealth = on; if (on) PostTask([]() { InstallDamageHooks(); }); break;
         case 3: unlimitedGloo = on; break;
-        case 4: PostTask([value]() { void* p = LocalPlayerHealth();
-                    if (p && AddGlooWalls) { void* c = *(void**)((char*)p + 0x30); if (c) AddGlooWalls(c, value, nullptr); } }); break;
-        case 5: PostTask([value]() { void* p = LocalPlayerHealth(); if (p && AddMedkitsCS) AddMedkitsCS(p, value, nullptr); }); break;
-        case 8: PostTask([value]() { int slot = value / 1000, idx = value % 1000;
+        case 6: unlimitedAmmo = on; break;
+        case 4: PostTask([value]() { if (g_pc && AddGlooWalls) AddGlooWalls(g_pc, value, nullptr); }); break;
+        case 5: PostTask([value]() { if (g_ph && AddMedkitsCS) AddMedkitsCS(g_ph, value, nullptr); }); break;
+        case 8: PostTask([value]() { int idx = value % 1000;               // পদ্ধতি A: তুলে নেওয়া (GetItem)
+                    if (weapons.empty()) RefreshWeapons();
+                    if (g_pc && PC_GetItem && idx >= 0 && idx < (int) weapons.size()) PC_GetItem(g_pc, weapons[idx], nullptr); }); break;
+        case 13: PostTask([value]() { int slot = value / 1000, idx = value % 1000;   // পদ্ধতি B: স্লটে বসানো (SetGun)
                     void* inv = m_GetStatic("Inventory", "Singleton");
                     if (weapons.empty()) RefreshWeapons();
                     if (inv && InvSetGun && idx >= 0 && idx < (int) weapons.size()) InvSetGun(inv, slot, weapons[idx], nullptr); }); break;
@@ -213,7 +266,7 @@ static void DoAction(int id, int value, bool on) {
                     if (m && CoinTransation) CoinTransation(m, value >= 0 ? 0 : 1, abs(value), nullptr); }); break;
         case 11: PostTask([value]() { void* m = m_GetStatic("MenuController", "instance");
                     if (m && DimondTransation) DimondTransation(m, value >= 0 ? 0 : 1, abs(value), nullptr); }); break;
-        case 12: PostTask([value]() { void* g = m_GetStatic("GameManager", "instance");
+        case 12: PostTask([value]() { void* g = m_GetStatic("GameManager", "instace"); if (!g) g = m_GetStatic("GameManager", "instance");
                     if (g && GM_AddMoney) GM_AddMoney(g, value, nullptr); }); break;
         default: break;
     }
@@ -305,6 +358,8 @@ void hack_thread() {
     AddMedkitsCS     = (decltype(AddMedkitsCS))     m_FindMethod("PlayerHealth", "AddMedkitsCS", 1);
     InvSetGun        = (decltype(InvSetGun))        m_FindMethod("Inventory", "SetGun", 2);
     FindObjectsOfTypeAll = (decltype(FindObjectsOfTypeAll)) m_FindMethodNS("UnityEngine", "Resources", "FindObjectsOfTypeAll", 1);
+    FindObjectsOfType    = (decltype(FindObjectsOfType))    m_FindMethodNS("UnityEngine", "Object", "FindObjectsOfType", 1);
+    PC_GetItem           = (decltype(PC_GetItem))           m_FindMethod("PlayerController", "GetItem", 1);
     if (il2_thread_detach && myThread) il2_thread_detach(myThread);   // থ্রেড শেষ হওয়ার আগে ডিটাচ (ক্র্যাশ এড়াতে)
 #endif
     LOGI(OBFUSCATE("FFIMOD hooks ready"));
