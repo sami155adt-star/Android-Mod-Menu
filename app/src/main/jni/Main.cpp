@@ -183,11 +183,23 @@ static void BuildGunNames() {
     gunNamesCache = r;
 }
 
+// ড্যামেজ হুক: শুধু প্রথমবার টগল অন করলে বসে (মূল থ্রেডে)। শুধু ১৬ বাইটের বেশি বড় মেথড হুক করা হয়।
+// AIHealth.TakeDamage ও ApplyDamage মাত্র ৮ বাইট (পাশের মেথড নষ্ট করত) তাই হুক করা হয় না।
+static bool dmgHooked = false;
+static void HookIt(void* addr, void* nw, void** old);
+static void InstallDamageHooks() {
+    if (dmgHooked) return;
+    dmgHooked = true;
+    HookIt(m_FindMethod("PlayerHealth", "GetDamage", 2), (void*) new_GetDamage, (void**) &old_GetDamage);
+    HookIt(m_FindMethod("PlayerHealth", "ApplyDamagePlayer", 4), (void*) new_ApplyDamagePlayer, (void**) &old_ApplyDamagePlayer);
+    HookIt(m_FindMethod("AIHealth", "TakeDamagePV", 3), (void*) new_AI_TakeDamagePV, (void**) &old_AI_TakeDamagePV);
+}
+
 // সব কাজ এক জায়গায় (নতুন মেনু ও পুরোনো মেনু দুটোই ব্যবহার করে)
 static void DoAction(int id, int value, bool on) {
     switch (id) {
-        case 1: oneHitKill = on; break;
-        case 2: unlimitedHealth = on; break;
+        case 1: oneHitKill = on; if (on) PostTask([]() { InstallDamageHooks(); }); break;
+        case 2: unlimitedHealth = on; if (on) PostTask([]() { InstallDamageHooks(); }); break;
         case 3: unlimitedGloo = on; break;
         case 4: PostTask([value]() { void* p = LocalPlayerHealth();
                     if (p && AddGlooWalls) { void* c = *(void**)((char*)p + 0x30); if (c) AddGlooWalls(c, value, nullptr); } }); break;
@@ -283,11 +295,6 @@ void hack_thread() {
     sleep(10);                                           // গেম পুরো লোড হতে দিন
     void* myThread = il2_thread_attach(il2_domain_get());
 
-    HookIt(m_FindMethod("PlayerHealth", "GetDamage", 2), (void*) new_GetDamage, (void**) &old_GetDamage);
-    HookIt(m_FindMethod("PlayerHealth", "ApplyDamagePlayer", 4), (void*) new_ApplyDamagePlayer, (void**) &old_ApplyDamagePlayer);
-    HookIt(m_FindMethod("AIHealth", "TakeDamage", 3), (void*) new_AI_TakeDamage, (void**) &old_AI_TakeDamage);
-    HookIt(m_FindMethod("AIHealth", "TakeDamagePV", 3), (void*) new_AI_TakeDamagePV, (void**) &old_AI_TakeDamagePV);
-    HookIt(m_FindMethod("AIHealth", "ApplyDamage", 3), (void*) new_AI_ApplyDamage, (void**) &old_AI_ApplyDamage);
     HookIt(m_FindMethod("MenuController", "Update", 0), (void*) new_MC_Update, (void**) &old_MC_Update);
     HookIt(m_FindMethod("PlayerController", "Update", 0), (void*) new_PC_Update, (void**) &old_PC_Update);
 
