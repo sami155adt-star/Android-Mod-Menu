@@ -17,6 +17,8 @@
 #include <fstream>
 #include <iostream>
 #include <dlfcn.h>
+#include <mutex>
+#include <functional>
 #include <cstdlib>
 #include "Includes/Logger.h"
 #include "Includes/obfuscate.h"
@@ -38,7 +40,7 @@ typedef void*  (*t_field)(void*, const char*);
 typedef void   (*t_sget)(void*, void*);
 static t_void  il2_domain_get;
 static t_asms  il2_domain_get_assemblies;
-static t_p1    il2_assembly_get_image, il2_thread_attach, il2_class_get_type, il2_type_get_object;
+static t_p1    il2_assembly_get_image, il2_thread_attach, il2_thread_detach, il2_class_get_type, il2_type_get_object;
 static t_cls   il2_class_from_name;
 static t_meth  il2_class_get_method_from_name;
 static t_field il2_class_get_field_from_name;
@@ -75,6 +77,7 @@ static void* m_GetStatic(const char* cls, const char* field) {
 static bool oneHitKill = false, unlimitedHealth = false, unlimitedGloo = false;
 static int  gunSlot = 0, gunNumber = 0;
 
+static void RunQueue();
 struct V3 { float x, y, z; };
 struct Q4 { float x, y, z, w; };
 
@@ -112,11 +115,15 @@ static void (*AddGlooWalls)(void*, int, void*);
 static void (*old_PC_Update)(void*, void*);
 static void new_PC_Update(void* self, void* mi) {
     old_PC_Update(self, mi);
+    RunQueue();
     if (unlimitedGloo && AddGlooWalls) {
         int cur = *(int*)((char*)self + 0x2CC);               // PlayerController.WallCount
         if (cur < 20) AddGlooWalls(self, 20 - cur, nullptr);
     }
 }
+
+static void (*old_MC_Update)(void*, void*);
+static void new_MC_Update(void* self, void* mi) { old_MC_Update(self, mi); RunQueue(); }
 
 // ---------- দরকারি মেথড ----------
 static void (*CoinTransation)(void*, int, int, void*);
@@ -145,6 +152,69 @@ static void PrintWeapons() {
     RefreshWeapons();
     for (size_t i = 0; i < weapons.size(); i++)
         LOGI("FFIMOD gun #%zu = %s", i, m_Str(*(void**)((char*)weapons[i] + 0x28)).c_str()); // WeaponName @0x28
+}
+
+// ---------- মূল (Unity) থ্রেডে কাজ চালানোর লাইন ----------
+// মেনুর বাটন Java থ্রেডে চাপা হয়। সেখান থেকে সরাসরি গেমের ফাংশন কল করা অনিরাপদ (ক্র্যাশের কারণ)।
+// তাই কাজগুলো লাইনে রাখা হয় এবং গেমের নিজের Update এর ভেতর থেকে চালানো হয়।
+static std::mutex qMtx;
+static std::vector<std::function<void()>> qTasks;
+static std::mutex gnMtx;
+static std::string gunNamesCache;
+
+static void PostTask(std::function<void()> f) {
+    std::lock_guard<std::mutex> l(qMtx);
+    if (qTasks.size() < 64) qTasks.push_back(f);
+}
+static void RunQueue() {
+    std::vector<std::function<void()>> local;
+    { std::lock_guard<std::mutex> l(qMtx); if (qTasks.empty()) return; local.swap(qTasks); }
+    for (auto& f : local) f();
+}
+static void BuildGunNames() {
+    RefreshWeapons();
+    std::string r;
+    for (size_t i = 0; i < weapons.size(); i++) {
+        std::string n = m_Str(*(void**)((char*)weapons[i] + 0x28));
+        if (n.empty()) n = "Weapon";
+        r += n; if (i + 1 < weapons.size()) r += "\n";
+    }
+    std::lock_guard<std::mutex> l(gnMtx);
+    gunNamesCache = r;
+}
+
+// সব কাজ এক জায়গায় (নতুন মেনু ও পুরোনো মেনু দুটোই ব্যবহার করে)
+static void DoAction(int id, int value, bool on) {
+    switch (id) {
+        case 1: oneHitKill = on; break;
+        case 2: unlimitedHealth = on; break;
+        case 3: unlimitedGloo = on; break;
+        case 4: PostTask([value]() { void* p = LocalPlayerHealth();
+                    if (p && AddGlooWalls) { void* c = *(void**)((char*)p + 0x30); if (c) AddGlooWalls(c, value, nullptr); } }); break;
+        case 5: PostTask([value]() { void* p = LocalPlayerHealth(); if (p && AddMedkitsCS) AddMedkitsCS(p, value, nullptr); }); break;
+        case 8: PostTask([value]() { int slot = value / 1000, idx = value % 1000;
+                    void* inv = m_GetStatic("Inventory", "Singleton");
+                    if (weapons.empty()) RefreshWeapons();
+                    if (inv && InvSetGun && idx >= 0 && idx < (int) weapons.size()) InvSetGun(inv, slot, weapons[idx], nullptr); }); break;
+        case 9: PostTask([]() { BuildGunNames(); }); break;
+        case 10: PostTask([value]() { void* m = m_GetStatic("MenuController", "instance");
+                    if (m && CoinTransation) CoinTransation(m, value >= 0 ? 0 : 1, abs(value), nullptr); }); break;
+        case 11: PostTask([value]() { void* m = m_GetStatic("MenuController", "instance");
+                    if (m && DimondTransation) DimondTransation(m, value >= 0 ? 0 : 1, abs(value), nullptr); }); break;
+        case 12: PostTask([value]() { void* g = m_GetStatic("GameManager", "instance");
+                    if (g && GM_AddMoney) GM_AddMoney(g, value, nullptr); }); break;
+        default: break;
+    }
+}
+
+// নতুন FfiMenu (Java) এর native ফাংশন
+extern "C" {
+JNIEXPORT void JNICALL Java_com_ffimod_FfiMenu_nToggle(JNIEnv*, jclass, jint id, jboolean on) { DoAction(id, 0, on); }
+JNIEXPORT void JNICALL Java_com_ffimod_FfiMenu_nAction(JNIEnv*, jclass, jint id, jint value) { DoAction(id, value, true); }
+JNIEXPORT jstring JNICALL Java_com_ffimod_FfiMenu_nGunNames(JNIEnv* env, jclass) {
+    std::string r; { std::lock_guard<std::mutex> l(gnMtx); r = gunNamesCache; }
+    return env->NewStringUTF(r.c_str());
+}
 }
 
 // ---------- মেনু তালিকা ----------
@@ -184,32 +254,7 @@ jobjectArray GetFeatureList(JNIEnv *env, jobject context) {
 
 // ---------- মেনুর বাটন/টগল ----------
 void Changes(JNIEnv *env, jclass clazz, jobject obj, jint featNum, jstring featName, jint value, jlong Lvalue, jboolean boolean, jstring text) {
-    switch (featNum) {
-        case 1: oneHitKill = boolean; break;
-        case 2: unlimitedHealth = boolean; break;
-        case 3: unlimitedGloo = boolean; break;
-        case 4: { void* p = LocalPlayerHealth();
-                  if (p && AddGlooWalls) {
-                      void* ctrl = *(void**)((char*)p + 0x30);     // PlayerHealth.Controller
-                      if (ctrl) AddGlooWalls(ctrl, value, nullptr);
-                  } break; }
-        case 5: { void* p = LocalPlayerHealth(); if (p && AddMedkitsCS) AddMedkitsCS(p, value, nullptr); break; }
-        case 6: gunSlot = value; break;                          // CHECK: Spinner 0 থেকে শুরু কিনা
-        case 7: gunNumber = value; break;
-        case 8: { void* inv = m_GetStatic("Inventory", "Singleton");
-                  RefreshWeapons();
-                  if (inv && InvSetGun && gunNumber >= 0 && gunNumber < (int) weapons.size())
-                      InvSetGun(inv, gunSlot, weapons[gunNumber], nullptr);
-                  break; }
-        case 9: PrintWeapons(); break;
-        case 10: { void* m = m_GetStatic("MenuController", "instance");
-                   if (m && CoinTransation) CoinTransation(m, value >= 0 ? 0 : 1, abs(value), nullptr); break; }
-        case 11: { void* m = m_GetStatic("MenuController", "instance");
-                   if (m && DimondTransation) DimondTransation(m, value >= 0 ? 0 : 1, abs(value), nullptr); break; }
-        case 12: { void* g = m_GetStatic("GameManager", "instance");   // CHECK: static ফিল্ডের নাম
-                   if (g && GM_AddMoney) GM_AddMoney(g, value, nullptr); break; }
-        default: break;
-    }
+    DoAction(featNum, value, boolean);
 }
 
 // ---------- হুক বসানো ----------
@@ -226,6 +271,7 @@ void hack_thread() {
     il2_domain_get_assemblies = (t_asms) dlsym(h, "il2cpp_domain_get_assemblies");
     il2_assembly_get_image = (t_p1) dlsym(h, "il2cpp_assembly_get_image");
     il2_thread_attach = (t_p1) dlsym(h, "il2cpp_thread_attach");
+    il2_thread_detach = (t_p1) dlsym(h, "il2cpp_thread_detach");
     il2_class_from_name = (t_cls) dlsym(h, "il2cpp_class_from_name");
     il2_class_get_method_from_name = (t_meth) dlsym(h, "il2cpp_class_get_method_from_name");
     il2_class_get_field_from_name = (t_field) dlsym(h, "il2cpp_class_get_field_from_name");
@@ -235,13 +281,14 @@ void hack_thread() {
     if (!il2_domain_get || !il2_class_from_name) { LOGE("il2cpp api missing"); return; }
 
     sleep(10);                                           // গেম পুরো লোড হতে দিন
-    il2_thread_attach(il2_domain_get());
+    void* myThread = il2_thread_attach(il2_domain_get());
 
     HookIt(m_FindMethod("PlayerHealth", "GetDamage", 2), (void*) new_GetDamage, (void**) &old_GetDamage);
     HookIt(m_FindMethod("PlayerHealth", "ApplyDamagePlayer", 4), (void*) new_ApplyDamagePlayer, (void**) &old_ApplyDamagePlayer);
     HookIt(m_FindMethod("AIHealth", "TakeDamage", 3), (void*) new_AI_TakeDamage, (void**) &old_AI_TakeDamage);
     HookIt(m_FindMethod("AIHealth", "TakeDamagePV", 3), (void*) new_AI_TakeDamagePV, (void**) &old_AI_TakeDamagePV);
     HookIt(m_FindMethod("AIHealth", "ApplyDamage", 3), (void*) new_AI_ApplyDamage, (void**) &old_AI_ApplyDamage);
+    HookIt(m_FindMethod("MenuController", "Update", 0), (void*) new_MC_Update, (void**) &old_MC_Update);
     HookIt(m_FindMethod("PlayerController", "Update", 0), (void*) new_PC_Update, (void**) &old_PC_Update);
 
     AddGlooWalls     = (decltype(AddGlooWalls))     m_FindMethod("PlayerController", "AddGlooWalls", 1);
@@ -251,6 +298,7 @@ void hack_thread() {
     AddMedkitsCS     = (decltype(AddMedkitsCS))     m_FindMethod("PlayerHealth", "AddMedkitsCS", 1);
     InvSetGun        = (decltype(InvSetGun))        m_FindMethod("Inventory", "SetGun", 2);
     FindObjectsOfTypeAll = (decltype(FindObjectsOfTypeAll)) m_FindMethodNS("UnityEngine", "Resources", "FindObjectsOfTypeAll", 1);
+    if (il2_thread_detach && myThread) il2_thread_detach(myThread);   // থ্রেড শেষ হওয়ার আগে ডিটাচ (ক্র্যাশ এড়াতে)
 #endif
     LOGI(OBFUSCATE("FFIMOD hooks ready"));
 }
